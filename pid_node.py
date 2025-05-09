@@ -38,6 +38,9 @@ class PIDcontroller(Node):
         self.last_steer_error = 0.0
         self.last_ACC_error = 0.0
         self.ACC_error_acc = 0.0
+        self.rel_speed = 0.0
+        self.last_distance = 0.0
+        self.front_car_speed = 0.0
         self.last_time = time.time()
 
     def waypoint_callback(self, msg: PoseStamped):
@@ -69,14 +72,24 @@ class PIDcontroller(Node):
         steering_angle = self.kp_steer*steer_error + self.kd_steer*d_steer_error
 
         """NEW PIDF LOOP FOR POSITION CONTROL"""
+        # calculate error change for derivative control
         d_ACC_error = (ACC_error - self.last_ACC_error)/dt
         self.last_ACC_error = ACC_error
-        speed = self.kp_ACC*ACC_error + self.ki_ACC*self.ACC_error_acc + self.kd_ACC*d_ACC_error + 0.6
-        self.ACC_error_acc += ACC_error*dt
+
+        self.speed = self.kp_ACC*ACC_error + self.ki_ACC*self.ACC_error_acc + self.kd_ACC*d_ACC_error + self.front_car_speed
+
         if speed > self.max_speed:
             speed = self.max_speed
         if speed < 0.0:
             speed = 0.0
+        # Calculating Feed-forward term for the next iteration
+        self.rel_speed = (x - self.last_distance)/dt
+        self.last_distance = x
+        self.front_car_speed = self.rel_speed + self.speed
+
+
+
+        self.ACC_error_acc += ACC_error*dt
         # Get the timestamp from the message header
         timestamp = msg.header.stamp
 
