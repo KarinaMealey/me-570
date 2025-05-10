@@ -5,7 +5,8 @@ from ackermann_msgs.msg import AckermannDriveStamped, AckermannDrive
 from rclpy.qos import qos_profile_sensor_data  # Quality of Service settings for real-time data
 import time
 from ros2_numpy import pose_to_np, to_ackermann
-import math
+from collections import deque
+import numpy as np
 
 class PIDcontroller(Node):
     def __init__(self):
@@ -35,6 +36,13 @@ class PIDcontroller(Node):
         # Create a timer that calls self.load_params every 10 seconds (10.0 seconds)
         self.timer = self.create_timer(10.0, self.load_params)
 
+        self.last_time = time.time()
+        self.last_steering_angle = 0.0
+
+        # Initialize deque with a fixed length of self.max_out
+        # This could be useful to allow the vehicle to temporarily lose the track for up to max_out frames before deciding to stop. (Currently not used yet.)
+        self.max_out = 9
+        self.success = deque([True] * self.max_out, maxlen=self.max_out)
         self.last_steer_error = 0.0
         self.last_ACC_error = 0.0
         self.ACC_error_acc = 0.0
@@ -43,16 +51,21 @@ class PIDcontroller(Node):
         self.front_car_speed = 0.0
         self.last_time = time.time()
 
+
     def waypoint_callback(self, msg: PoseStamped):
 
         # Convert incoming pose message to position, heading, and timestamp
         point, heading, timestamp_unix = pose_to_np(msg)
 
-        if any(math.isnan(x) for x in point):
-            timestamp = msg.header.stamp
-            ackermann_msg = to_ackermann(0.0, 0.0, timestamp)
-            self.publisher.publish(ackermann_msg)
+        # If the detected point contains NaN (tracking lost) stop the vehicle
+        if np.isnan(point).any():
+            ackermann_msg = to_ackermann(0.0, self.last_steering_angle, timestamp_unix)
+            self.publisher.publish(ackermann_msg) # BRAKE
+            self.success.append(False)
             return
+        else:
+            self.success.append(True)
+
 
         # Calculate time difference since last callback
         dt = timestamp_unix - self.last_time
@@ -62,7 +75,7 @@ class PIDcontroller(Node):
         # Get x and y coordinates (ignore z), and compute the error in y
         x, y, z = point
         steer_error = -y
-        ACC_error = self.desired_distance - z
+        ACC_error = self.desired_distance - x
 
         # Calculate the derivative of the error (change in error over time)
         d_steer_error = (steer_error-self.last_steer_error)/dt
@@ -75,26 +88,20 @@ class PIDcontroller(Node):
         # calculate error change for derivative control
         d_ACC_error = (ACC_error - self.last_ACC_error)/dt
         self.last_ACC_error = ACC_error
-
         self.speed = self.kp_ACC*ACC_error + self.ki_ACC*self.ACC_error_acc + self.kd_ACC*d_ACC_error + self.front_car_speed
+        
+        self.speed = max(min(self.max_speed, self.speed), 0.0)
 
-        if speed > self.max_speed:
-            speed = self.max_speed
-        if speed < 0.0:
-            speed = 0.0
         # Calculating Feed-forward term for the next iteration
         self.rel_speed = (x - self.last_distance)/dt
         self.last_distance = x
-        self.front_car_speed = self.rel_speed + self.speed
+        #self.front_car_speed = self.rel_speed + self.speed
 
-
-
-        self.ACC_error_acc += ACC_error*dt
         # Get the timestamp from the message header
         timestamp = msg.header.stamp
 
         # Create an Ackermann drive message with speed and steering angle
-        ackermann_msg = to_ackermann(speed, steering_angle, timestamp)
+        ackermann_msg = to_ackermann(self.speed, steering_angle, timestamp)
 
         # Publish the message to the vehicle
         self.publisher.publish(ackermann_msg)
@@ -102,7 +109,7 @@ class PIDcontroller(Node):
         # Save the current error for use in the next iteration
         self.last_steer_error = steer_error
 
-        self.get_logger().info(f"{steering_angle=}")
+        self.get_logger().info(f"{self.speed=}")
 
 
     def declare_params(self):
@@ -112,9 +119,9 @@ class PIDcontroller(Node):
             namespace='',
             parameters=[
                 ('kp_steer', 0.9),
-                ('kd_steer', 0.0),
+                ('kd_steer', 0.1),
                 ('kp_ACC', 0.9),
-                ('ki_ACC', 0.1),
+                ('ki_ACC', 0.0),
                 ('kd_ACC', 0.0),
                 ('max_speed', 1.5),
                 ('desired_distance', 0.5),

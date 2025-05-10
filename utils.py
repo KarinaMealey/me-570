@@ -1,8 +1,7 @@
+
 import numpy as np
 import yaml
 import cv2
-
-CAR_ID_NUM = 0
 
 def get_corners(cx, cy, win_w, win_h, image_w, image_h):
     # Calculate the search window coordinates, ensuring they are within image bounds
@@ -30,7 +29,7 @@ def to_surface_coordinates(u, v, H):
     # Apply homography transformation
     points = H @ pixels  # Matrix multiplication (3,3) @ (3,N) -> (3,N)
 
-    # Normalize x, y, and z by w
+    # Normalize x, y by w
     x, y = points[:2] / points[-1]  # Normalize x and y by the last row (homogeneous coordinate)
 
     # If x and y are single-element arrays, unpack them to return scalars
@@ -60,7 +59,7 @@ def read_transform_config(filepath):
     H = np.array(eval(homography_str))
     return H
     
-    
+
 def draw_box(image, im_canny, corners, color=(0, 255, 0), thickness = 2):
 
     x1, x2, y1, y2 = corners
@@ -76,7 +75,6 @@ def draw_box(image, im_canny, corners, color=(0, 255, 0), thickness = 2):
 
     return image
 
-
 def get_car_loc(predictions, class_ids = [0]):
         """
         Process the model predictions and create a mask image.
@@ -88,12 +86,14 @@ def get_car_loc(predictions, class_ids = [0]):
         - numpy.ndarray or None: The final mask image resized to the original input size, or None if no masks were found.
         """
 
+        if len(predictions) == 0: return False, None
+
         # We only process one image at a time (batch size = 1)
         p = predictions[0]
 
-        bboxs = p.boxes
-        ids = bboxs.cls.cpu().numpy()        # Class IDs (e.g., left line, right line)
-        confidences = bboxs.conf.cpu().numpy() # Confidence scores (not used here)
+        all_bboxs = p.boxes
+        ids = all_bboxs.cls.cpu().numpy()        # Class IDs (e.g., left line, right line)
+        confidences = all_bboxs.conf.cpu().numpy() # Confidence scores (not used here)
         
         # Create a mask for detections that match our target classes (we're only interested in the center line)
         cls_mask = np.isin(ids, class_ids)
@@ -102,73 +102,55 @@ def get_car_loc(predictions, class_ids = [0]):
             return False, None
          # Keep only the masks and IDs that match our class of interest
         ids = ids[cls_mask]
+        bboxs = all_bboxs[cls_mask]
         confidences = confidences[cls_mask]
         if len(confidences) < 1:
             return False, None
         
         # find highest value confidence
         max_con = confidences[0]
-        i = 0     
-        j = 0   
-        for con_val in confidences:
-            if con_val > max_con:
-                max_con = con_val
-                j=i
-            i += 1
-        bbox = bboxs[j]
+        i=0
+        j=0
+        #for con_val in confidences:
+        #    if con_val > max_con:
+        #        max_con = con_val
+        #        j=i
+        #    i += 1
+        #if len(bboxs) < 1:
+        #    return False, None
+        bbox = bboxs[0]
         xyxy = bbox.xyxy.cpu().numpy()
-        if len(xyxy) < 4:
-            return False, None
         # x value is the midpoint of the bounding box
-        x_val = round((xyxy[0] + xyxy[2])/2.0)
-        y_val = round(xyxy[3])
+        if xyxy.shape[0] < 3:
+            return False, None
+        x1,y1,x2,y2 = xyxy[0]
+        x_val = round((x1 + x2)/2.0)
+        y_val = round(y2)
         return True, (x_val, y_val)
+def detect_bbox_center(predictions, target_id):
+    # Check if there are any predictions
+    if len(predictions) == 0:
+        return False, None, None
 
+    p = predictions[0].cpu()  # Get the first prediction (move to CPU)
+    all_boxes = p.boxes  # Access the bounding boxes
+    ids = all_boxes.cls.numpy()  # Class IDs for each detected object
+    confidences = all_boxes.conf.numpy()  # Confidence scores for each detection
 
-def parse_onnx_predictions(predictions, class_ids = [0]):
-    """
-    Process the model predictions and create a mask image for the specified class IDs.
+    # Check if the target class ID is present in the predictions
+    if target_id not in ids:
+        return False, None, None
 
-    Parameters:
-    - predictions (list): A list containing prediction results, typically including bounding boxes, masks, and class labels.
-    - class_ids (list): List of class IDs to be included in the mask (default is [0] for center line).
+    # Filter the boxes with the target ID
+    boxes = all_boxes[ids == target_id]
 
-    Returns:
-    - bool: True if at least one valid mask is found, False otherwise.
-    - numpy.ndarray or None: The final mask image resized to the original input size, or None if no masks match the specified class IDs.
-    """
+    # Extract the center and size (xywh) of the first box
+    center_x, center_y, w, h = boxes.xywh[0].numpy()
 
-    # We only process one image at a time (batch size = 1)
-    if len(predictions) < 1:
-        return False, None
+    # Calculate the bottom center Y-coordinate
+    bottom_y = center_y + h // 2  # Use + instead of - to get the bottom y
 
-    p = predictions[0]
-
-    ids = np.array(p.class_ids)  # Class IDs e.g., center line (0), stop sign (1)
-    masks = np.array(p.masks)  # Masks for each detected object
-
-    # Create a mask for detections that match our target class IDs
-    cls_mask = np.isin(ids, class_ids)
-
-    # If none of the detections match the desired class IDs, exit early
-    if not cls_mask.any():
-        return False, None
-
-    # Keep only the masks and IDs that match the class of interest
-    ids = ids[cls_mask]
-    masks = masks[cls_mask]
-
-    # Create an empty output image to store our final mask
-    output = np.zeros_like(masks[0], dtype=np.uint8)
-
-    for i, mask in enumerate(masks):
-        # We expect only one left and one right lane line (or other relevant objects)
-        # If there are multiple detections, we combine them into one mask
-        # (Alternatively, we could keep only the detection with the highest confidence)
-        output[mask == 1] = ids[i] + 1  # Add +1 to avoid zero (background) value
-
-    return True, output
-
+    return True, float(center_x), float(bottom_y)  # Return the bottom center coordinates
 def parse_predictions(predictions, class_ids = [0]):
     """
     Process the model predictions and create a mask image.
@@ -181,9 +163,6 @@ def parse_predictions(predictions, class_ids = [0]):
     """
 
     # We only process one image at a time (batch size = 1)
-    if len(predictions) < 1:
-      return False, None
-
     p = predictions[0]
 
     bboxs = p.boxes
@@ -224,6 +203,7 @@ def parse_predictions(predictions, class_ids = [0]):
         output[mask == 1] = ids[i] + 1  # We add +1 because background is 0
 
     return True, output
+
 def get_base(mask, N = 100):
     y, x = np.nonzero(mask)
     xs = x[np.argsort(y, )][-N:]
@@ -233,68 +213,4 @@ def get_base(mask, N = 100):
 
     return cx, cy
 
-"""# Apply preprocessing (Canny edge detection)
-im_canny = self.preprocess_image(image)
 
-# Find the line center position
-success, self.win_x = self.find_center(self.win_x, im_canny)
-
-# Plot and publish result if debug is Trze
-if self.debug:
-    corners = self.get_corners(self.win_x)
-    result = draw_box(image, im_canny, corners)
-    im_msg = np_to_image(result)
-    self.im_publisher.publish(im_msg)
-
-if success:
-    
-    # Transform from pixel to world coordinates
-    x, y = self.to_surface_coordinates(self.win_x, self.win_y)
-
-    # Extract the timestamp from the incoming image message
-    timestamp = msg.header.stamp
-
-    # Publish waypoint as Pose message
-    pose_msg = np_to_pose(np.array([x, y]), 0.0, timestamp=timestamp)
-    self.publisher.publish(pose_msg)
-    self.get_logger().info(f"{self.win_x=}")
-
-else:
-    # self.get_logger().info(f"{self.win_x}")
-    self.get_logger().info("Lost track!")"""
-"""def preprocess_image(self, image, filter_method = "Gaussian"):
-# Convert to grayscale
-im_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-# Blur the image
-if filter_method == "Gaussian":
-    im_burred = cv2.GaussianBlur(im_gray, self.kernel, 0)
-elif filter_method == "Median":
-    im_burred = cv2.medianBlur(im_gray, self.k)
-else:
-    raise ValueError('filter_method must only be "Gaussian" or "Median"')
-# Apply Canny edge detection
-im_canny = cv2.Canny(im_burred, self.canny_min, self.canny_max) # 0-255
-
-return im_canny
-
-def find_center(self, win_x, im_canny):
-
-corners = self.get_corners(win_x)
-x1, x2, y1, y2 = corners
-
-patch = im_canny[y1:y2, x1:x2]
-
-# Find all non-zero (white) pixels in the image
-ys, xs = np.nonzero(patch)
-
-if len(xs) == 0:
-    print("Lost track!")
-    return False, self.win_x
-
-self.win_x = x1 + int(np.mean(xs))
-
-#offset = im_center - win_x
-#print(offset)
-# return: A tuple (success flag, updated center).
-return True, self.win_x"""
