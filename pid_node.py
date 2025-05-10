@@ -75,7 +75,9 @@ class PIDcontroller(Node):
         # Get x and y coordinates (ignore z), and compute the error in y
         x, y, z = point
         steer_error = -y
-        ACC_error = self.desired_distance - x
+
+        """MAKE SURE TO CHANGE THIS LINE NEXT TIME"""
+        ACC_error = -(self.desired_distance - x)
 
         # Calculate the derivative of the error (change in error over time)
         d_steer_error = (steer_error-self.last_steer_error)/dt
