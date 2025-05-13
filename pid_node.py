@@ -18,12 +18,12 @@ class PIDcontroller(Node):
         qos_profile.depth = 1  # Keep only the latest message
 
         # Create a publisher for sending AckermannDriveStamped messages to the '/autonomous/ackermann_cmd' topic
-        self.publisher = self.create_publisher(AckermannDriveStamped, 'autonomous/ackermann_cmd', qos_profile)
+        self.publisher = self.create_publisher(AckermannDriveStamped, '/autonomous/ackermann_cmd', qos_profile)
 
         # Create a subscription to listen for PoseStamped messages from the '/waypoint' topic
         # When a message is received, the 'self.waypoint_callback' function is called
-        self.way_sub = self.create_subscription(PoseStamped,'waypoint', self.waypoint_callback, qos_profile)
-        self.obj_sub = self.create_subscription(PoseStamped,'object', self.obj_callback, qos_profile)
+        self.way_sub = self.create_subscription(PoseStamped,'/waypoint', self.waypoint_callback, qos_profile)
+        self.obj_sub = self.create_subscription(PoseStamped,'/object', self.obj_callback, qos_profile)
 
         # Load parameters
         self.params_set = False
@@ -33,23 +33,17 @@ class PIDcontroller(Node):
         # Create a timer that calls self.load_params every 10 seconds (10.0 seconds)
         self.timer = self.create_timer(10.0, self.load_params)
 
+        self.last_error = 0.0
         self.last_time = time.time()
         self.last_steering_angle = 0.0
-        self.last_steer_error = 0.0
-        self.last_ACC_error = 0.0
-        self.ACC_error_acc = 0.0
-        self.rel_speed = 0.0
-        self.last_distance = 0.0
-        self.front_car_speed = 0.0
 
-        self.min_dist = 1.0
         # Initialize deque with a fixed length of self.max_out
         # This could be useful to allow the vehicle to temporarily lose the track for up to max_out frames before deciding to stop. (Currently not used yet.)
         self.max_out = 9
         self.success = deque([True] * self.max_out, maxlen=self.max_out)
 
         self.len_history = 10
-        self.id2target = {0: 'car'}
+        self.id2target = {0: 'car', 1: 'center'}
 
         # Initialize target metadata for each label (e.g. stop sign, speed signs)
         self.targets = {
@@ -72,9 +66,10 @@ class PIDcontroller(Node):
         if target['detected'] and not target['reacted']:
             if target['distance'] < target['min_distance']:
                 ackermann_msg = to_ackermann(0.0, self.last_steering_angle)
-                self.publisher.publish(ackermann_msg)  # BRAKE
-                time.sleep(duration)  # Wait for a specified duration
-                target['reacted'] = True  # Mark target as handled
+                self.publisher.publish(ackermann_msg)           # BRAKE
+                self.get_logger().info("Brake for 2 sec")
+                time.sleep(duration)                            # Wait for a specified duration
+                target['reacted'] = True                        # Mark target as handled
 
         if not any(target['history']) and target['reacted']:
             target['reacted'] = False  # Reset reaction flag if the target hasn't been detected in any recent frames
@@ -86,23 +81,32 @@ class PIDcontroller(Node):
         point, heading, timestamp_unix = pose_to_np(msg)
 
         id = int(point[-1]) # Extract class ID stored in the z-coordinate
-
-        if id not in list(self.id2target.keys()): return
-        
-        x, y = point[:2] # Get distance
+        x, _ = point[:2] # Get distance
         lbl = self.id2target[id]
         data = self.targets[lbl]
+        self.get_logger().info(f"{lbl=}")
 
         
         # Check if point is NaN (object not detected or not visible)
-        if lbl=='car':
+        if np.isnan(point).any():
+            data['history'].append(False)
+            #self.get_logger().info("Object Not Detected")
+        else:
+            data['history'].append(True)
+            data['distance'] = x
+            #self.get_logger().info("Object Detected")
+
+        # Check if the model has detected the car
+        # If so, decrease speed appropriately
+        if lbl == 'car':
             x = max(self.min_dist, x)
             self.speed = (1-self.min_dist/x)*self.max_speed
-        
+            self.get_logger().info(f"{self.speed=}")
             
 
+
     def waypoint_callback(self, msg: PoseStamped):
-        
+
         # Convert incoming pose message to position, heading, and timestamp
         point, heading, timestamp_unix = pose_to_np(msg)
 
@@ -112,6 +116,8 @@ class PIDcontroller(Node):
             if any(self.success):
                 # Keep driving with the last known steering angle unless the line is lost for self.max_out consecutive frames
                 ackermann_msg = to_ackermann(self.speed, self.last_steering_angle, timestamp_unix)
+                self.get_logger().info("Lost Line, Following Prev Commands")
+                self.get_logger().info(f"{self.speed=}")
             else:
                 ackermann_msg = to_ackermann(0.0, self.last_steering_angle, timestamp_unix)
                 self.publisher.publish(ackermann_msg) # BRAKE
@@ -128,21 +134,16 @@ class PIDcontroller(Node):
 
         # Get x and y coordinates (ignore z), and compute the error in y
         x, y, _ = point
-        steering_error = 0.0 - y  # Assuming the goal is to stay centered at y = 0
+        error = 0.0 - y  # Assuming the goal is to stay centered at y = 0
 
-        ACC_error = -(self.desired_distance - x)
         # Calculate the derivative of the error (change in error over time)
-        d_error = (steering_error - self.last_steer_error) / dt 
+        d_error = (error - self.last_error) / dt 
 
         # Compute the steering angle using a PD controller
-        steering_angle = (self.kp_steer * steering_error) + (self.kd_steer * d_error)
+        steering_angle = (self.kp * error) + (self.kd * d_error)
 
         # Get the timestamp from the message header
         timestamp = msg.header.stamp
-
-        """NEW PIDF LOOP FOR POSITION CONTROL"""
-        # calculate error change for derivative control
-
 
         # Create an Ackermann drive message with speed and steering angle
         ackermann_msg = to_ackermann(self.speed, steering_angle, timestamp)
@@ -151,11 +152,14 @@ class PIDcontroller(Node):
         self.publisher.publish(ackermann_msg)
 
         # Save the current error for use in the next iteration
-        self.last_steer_error = steering_error
+        self.last_error = error
+        self.get_logger().info(f"{error=}")
 
         # If tracking is lost, continue driving with the last known steering angle
         # to follow the previously estimated path (e.g., maintain the current curve)
         self.last_steering_angle = steering_angle
+        global angle 
+        angle = steering_angle
 
 
     def declare_params(self):
@@ -164,27 +168,21 @@ class PIDcontroller(Node):
         self.declare_parameters(
             namespace='',
             parameters=[
-                ('kp_steer', 0.9),
-                ('kd_steer', 0.1),
-                ('kp_ACC', 0.09),
-                ('ki_ACC', 0.0),
-                ('kd_ACC', 0.0),
-                ('max_speed', 1.0),
-                ('desired_distance', 1.0),
-                ('speed', 0.0),
+                ('kp', 0.9),  # OG Number=9
+                ('kd', 0.0),  # OG Number=0
+                ('speed', 0.6),
+                ('max_speed', 1.5),
+                ('min_dist', 2.0)
             ]
         )
 
     def load_params(self):
         try:
-            self.kp_steer = self.get_parameter('kp_steer').get_parameter_value().double_value
-            self.kd_steer = self.get_parameter('kd_steer').get_parameter_value().double_value
-            self.kp_ACC = self.get_parameter('kp_ACC').get_parameter_value().double_value
-            self.ki_ACC = self.get_parameter('ki_ACC').get_parameter_value().double_value
-            self.kd_ACC = self.get_parameter('kd_ACC').get_parameter_value().double_value
-            self.max_speed = self.get_parameter('max_speed').get_parameter_value().double_value
-            self.desired_distance = self.get_parameter('desired_distance').get_parameter_value().double_value
+            self.kp = self.get_parameter('kp').get_parameter_value().double_value
+            self.kd = self.get_parameter('kd').get_parameter_value().double_value
             self.speed = self.get_parameter('speed').get_parameter_value().double_value
+            self.min_dist = self.get_parameter('min_dist').get_parameter_value().double_value
+            self.max_speed = self.get_parameter('max_speed').get_parameter_value().double_value
 
             if not self.params_set:
                 self.get_logger().info("Parameters loaded successfully")
